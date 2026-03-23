@@ -189,6 +189,114 @@ server.tool(
   }
 );
 
+// 6. kb_init
+server.tool(
+  "kb_init",
+  "Scan for CLAUDE.md files across all projects, extract key info, and import into the knowledge base. Run once after install to bootstrap your KB from existing projects.",
+  {
+    scan_dirs: z
+      .string()
+      .default("~,~/dev,~/projects,~/src,~/work")
+      .describe("Comma-separated directories to scan for projects with CLAUDE.md"),
+  },
+  async ({ scan_dirs }) => {
+    const home = os.homedir();
+    const dirs = scan_dirs.split(",").map((d) => d.trim().replace("~", home));
+    const found: { project: string; claudeMdPath: string; summary: string }[] = [];
+
+    // Scan for CLAUDE.md files
+    for (const dir of dirs) {
+      if (!fs.existsSync(dir)) continue;
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (!entry.isDirectory()) continue;
+          const claudeMd = path.join(dir, entry.name, "CLAUDE.md");
+          if (fs.existsSync(claudeMd)) {
+            const content = fs.readFileSync(claudeMd, "utf-8");
+            found.push({
+              project: entry.name,
+              claudeMdPath: claudeMd,
+              summary: content,
+            });
+          }
+        }
+      } catch {
+        // skip inaccessible dirs
+      }
+    }
+
+    // Also check ~/.claude/CLAUDE.md (global)
+    const globalClaude = path.join(home, ".claude", "CLAUDE.md");
+    if (fs.existsSync(globalClaude)) {
+      found.push({
+        project: "_global",
+        claudeMdPath: globalClaude,
+        summary: fs.readFileSync(globalClaude, "utf-8"),
+      });
+    }
+
+    if (found.length === 0) {
+      return {
+        content: [{ type: "text", text: "No CLAUDE.md files found in scanned directories." }],
+      };
+    }
+
+    // Ensure KB dirs exist
+    for (const d of ["systems", "ops", "decisions", "inbox"]) {
+      const p = path.join(KB_DIR, d);
+      if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+    }
+
+    // Import each project
+    const results: string[] = [];
+    for (const { project, claudeMdPath, summary } of found) {
+      if (project === "_global") {
+        // Global rules → ops/global-rules.md
+        const target = path.join(KB_DIR, "ops", "global-rules.md");
+        if (!fs.existsSync(target)) {
+          fs.writeFileSync(target, summary);
+          results.push(`  ops/global-rules.md ← ${claudeMdPath} (new)`);
+        } else {
+          results.push(`  ops/global-rules.md ← already exists, skipped`);
+        }
+        continue;
+      }
+
+      // Project → systems/<project>.md
+      const safeName = project.toLowerCase().replace(/[^a-z0-9-]/g, "-");
+      const target = path.join(KB_DIR, "systems", `${safeName}.md`);
+
+      if (fs.existsSync(target)) {
+        results.push(`  systems/${safeName}.md ← already exists, skipped`);
+        continue;
+      }
+
+      // Extract first 200 lines as summary (full CLAUDE.md can be huge)
+      const lines = summary.split("\n").slice(0, 200);
+      const trimmed = lines.join("\n");
+      const header = `# ${project}\n\n> Imported from ${claudeMdPath}\n> Run kb_init again to refresh (will skip existing files — delete first to reimport)\n\n`;
+
+      fs.writeFileSync(target, header + trimmed);
+      results.push(`  systems/${safeName}.md ← ${claudeMdPath} (imported)`);
+    }
+
+    rebuildIndex();
+    const commitResult = gitCommit(`init: imported ${found.length} project docs`);
+
+    const report = [
+      `Scanned: ${dirs.join(", ")}`,
+      `Found ${found.length} CLAUDE.md files:`,
+      "",
+      ...results,
+      "",
+      `Git: ${commitResult}`,
+    ].join("\n");
+
+    return { content: [{ type: "text", text: report }] };
+  }
+);
+
 // ── Start ──
 
 async function main() {

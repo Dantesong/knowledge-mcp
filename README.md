@@ -13,6 +13,7 @@ Exposes 5 tools to Claude Code via stdio MCP:
 | `kb_write` | Write/append to a document (auto git commit) |
 | `kb_log_decision` | Log a technical decision with timestamp |
 | `kb_index` | Show the full document index |
+| `kb_init` | Scan all projects for CLAUDE.md, auto-import into KB |
 
 Every write operation automatically commits to git, giving you version history of all knowledge changes.
 
@@ -53,6 +54,17 @@ claude mcp add --scope user knowledge -- node /path/to/knowledge-mcp/dist/index.
 # Or with custom KB location
 claude mcp add --scope user knowledge -- node /path/to/knowledge-mcp/dist/index.js -e KNOWLEDGE_DIR=/path/to/knowledge
 ```
+
+## Bootstrap from existing projects
+
+After install, run `kb_init` to auto-import all your CLAUDE.md files:
+
+```
+> Initialize my knowledge base from all my projects
+  → calls kb_init(scan_dirs="~,~/dev,~/projects")
+```
+
+This scans for CLAUDE.md files, extracts key info, and creates docs in `~/knowledge/systems/`. Safe to run multiple times — skips files that already exist.
 
 ## Usage
 

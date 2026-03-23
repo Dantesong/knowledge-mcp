@@ -17,6 +17,7 @@ Claude Code 每次新开 session 都会"失忆"。CLAUDE.md 能写规则，但�
 | `kb_write` | 写入/追加文档（自动 git commit） |
 | `kb_log_decision` | 记录技术决策（带时间戳） |
 | `kb_index` | 查看知识库目录索引 |
+| `kb_init` | 扫描所有项目的 CLAUDE.md，自动导入知识库 |
 
 ## 安装
 
@@ -54,6 +55,25 @@ claude mcp add --scope user knowledge -- node /你的路径/knowledge-mcp/dist/i
 # 自定义知识库路径
 claude mcp add --scope user knowledge -- node /你的路径/knowledge-mcp/dist/index.js -e KNOWLEDGE_DIR=/自定义路径/knowledge
 ```
+
+## 一键导入现有项目
+
+安装后，让 AI 跑一次 `kb_init`，自动扫描所有项目的 CLAUDE.md 并导入：
+
+```
+你: 初始化知识库，把所有项目的文档导入
+AI: → 调用 kb_init(scan_dirs="~,~/dev,~/projects")
+
+输出:
+  Scanned: /Users/you, /Users/you/dev, /Users/you/projects
+  Found 5 CLAUDE.md files:
+    systems/my-app.md ← ~/dev/my-app/CLAUDE.md (imported)
+    systems/api-server.md ← ~/dev/api-server/CLAUDE.md (imported)
+    ops/global-rules.md ← ~/.claude/CLAUDE.md (imported)
+    ...
+```
+
+安全重复执行 — 已存在的文件会跳过。
 
 ## 使用方式
 

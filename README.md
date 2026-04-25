@@ -4,18 +4,49 @@ A local MCP server that gives Claude Code persistent memory through a git-manage
 
 ## What it does
 
-Exposes 6 tools to Claude Code via stdio MCP:
+Exposes 9 tools to Claude Code via stdio MCP:
 
 | Tool | Description |
 |------|-------------|
 | `kb_search` | Grep search across all .md files |
 | `kb_read` | Read a specific document |
-| `kb_write` | Write/append to a document (auto git commit) |
+| `kb_write` | Write/append to a document (auto git commit, optional drift-stamping) |
 | `kb_log_decision` | Log a technical decision with timestamp |
 | `kb_index` | Rebuild the full document index |
 | `kb_init` | Scan all projects for CLAUDE.md, auto-import into KB |
+| `kb_link_track` | Link a doc to a source repo + paths it tracks (drift baseline) |
+| `kb_drift` | Diff one doc vs source code since last verify; optional `bump` to rebaseline |
+| `kb_drift_all` | Drift dashboard 🟢/🟡/🔴 across all linked docs (optional repo filter) |
 
 Every write operation automatically commits to git, giving you version history of all knowledge changes.
+
+## Drift detection (added 2026-04-25)
+
+Plain `kb_write` is content-blind: calling it once per session satisfies the Stop hook even if 9 other docs that referenced the same code paths drifted silently. Long-term that produces major info gaps in the KB.
+
+Drift detection links each doc to the code it documents via YAML frontmatter:
+
+```yaml
+---
+last-verified-commit: a60044b1010084ebdb0a054e661bb8e8cb85829c
+last-verified-at: 2026-04-25T15:30:00.000Z
+code-repo: /Users/dante/develop/auto-hotelier
+code-tracks: ["packages/db/prisma/schema.prisma","packages/db/prisma/migrations/"]
+---
+
+# Doc title
+... body ...
+```
+
+Workflow:
+
+1. **One-time setup** per doc: `kb_link_track` declares the repo + paths the doc tracks (or pass `codeRepo`+`codeTracks` directly to `kb_write`)
+2. **At session start / phase boundaries**: `kb_drift_all` shows which docs are 🟢 at HEAD / 🟡 small drift / 🔴 major drift
+3. **Per-doc drill-in**: `kb_drift <path>` outputs the actual `git log <last-verified>..HEAD -- <code-tracks>` so you see exactly which commits the doc may not yet reflect
+4. **After updating a doc**: `kb_write` auto-stamps `last-verified-commit` to current HEAD so the drift counter resets
+5. **No-op rebaseline**: `kb_drift <path> bump=true` for cases where source changed but the doc's claims didn't need an update
+
+The Stop hook (`hooks/kb-stop-guard.sh`) uses the linkage too: if you change code in repo X, the hook scans all docs with `code-repo: X` and `code-tracks` matching your changed files, and blocks the stop until those specific docs are touched (or `kb_drift bump=true` is run on each).
 
 ## Install
 

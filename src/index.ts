@@ -29,6 +29,147 @@ function gitCommit(message: string): string {
   }
 }
 
+// ── Frontmatter (drift-tracking metadata) ──
+//
+// Each KB doc may carry a YAML-ish frontmatter block at the very top:
+//
+//   ---
+//   last-verified-commit: a60044b
+//   last-verified-at: 2026-04-25T13:45:00.000Z
+//   code-repo: /Users/dante/develop/auto-hotelier
+//   code-tracks: ["packages/db/prisma/schema.prisma","apps/core/src/services"]
+//   ---
+//
+// `kb_write` injects/updates these fields automatically when the caller
+// passes `codeRepo`. `kb_drift` uses them to diff code since last verify.
+//
+// We intentionally roll our own micro-parser instead of pulling a YAML
+// dependency: the schema is fixed and small, and we want zero new deps.
+
+interface Frontmatter {
+  lastVerifiedCommit?: string;
+  lastVerifiedAt?: string;
+  codeRepo?: string;
+  codeTracks?: string[];
+  [extra: string]: unknown;
+}
+
+function parseFrontmatter(content: string): { fm: Frontmatter; body: string } {
+  if (!content.startsWith("---\n")) return { fm: {}, body: content };
+  const endIdx = content.indexOf("\n---\n", 4);
+  if (endIdx < 0) return { fm: {}, body: content };
+  const fmStr = content.slice(4, endIdx);
+  const body = content.slice(endIdx + 5);
+  const fm: Frontmatter = {};
+  for (const line of fmStr.split("\n")) {
+    const m = line.match(/^([a-z][a-z0-9_-]*):\s*(.*)$/);
+    if (!m) continue;
+    const key = m[1];
+    const val = m[2].trim();
+    if (key === "last-verified-commit") fm.lastVerifiedCommit = val;
+    else if (key === "last-verified-at") fm.lastVerifiedAt = val;
+    else if (key === "code-repo") fm.codeRepo = val;
+    else if (key === "code-tracks") {
+      // Accept JSON array or [a, b] without quotes
+      try {
+        fm.codeTracks = JSON.parse(val) as string[];
+      } catch {
+        fm.codeTracks = val
+          .replace(/[\[\]]/g, "")
+          .split(",")
+          .map((s) => s.trim().replace(/^["']|["']$/g, ""))
+          .filter(Boolean);
+      }
+    } else {
+      fm[key] = val;
+    }
+  }
+  return { fm, body };
+}
+
+function serializeFrontmatter(fm: Frontmatter): string {
+  const lines: string[] = ["---"];
+  if (fm.lastVerifiedCommit) lines.push(`last-verified-commit: ${fm.lastVerifiedCommit}`);
+  if (fm.lastVerifiedAt) lines.push(`last-verified-at: ${fm.lastVerifiedAt}`);
+  if (fm.codeRepo) lines.push(`code-repo: ${fm.codeRepo}`);
+  if (fm.codeTracks && fm.codeTracks.length > 0) {
+    lines.push(`code-tracks: ${JSON.stringify(fm.codeTracks)}`);
+  }
+  // Preserve any unknown keys (forward-compat)
+  for (const k of Object.keys(fm)) {
+    if (
+      ["lastVerifiedCommit", "lastVerifiedAt", "codeRepo", "codeTracks"].includes(k)
+    ) {
+      continue;
+    }
+    const v = fm[k];
+    if (typeof v === "string") lines.push(`${k}: ${v}`);
+  }
+  lines.push("---", "");
+  return lines.join("\n");
+}
+
+function upsertFrontmatter(content: string, updates: Partial<Frontmatter>): string {
+  const { fm, body } = parseFrontmatter(content);
+  // Merge: explicit undefined in updates means "leave existing alone"
+  const merged: Frontmatter = { ...fm };
+  for (const k of Object.keys(updates)) {
+    const v = (updates as Record<string, unknown>)[k];
+    if (v !== undefined) (merged as Record<string, unknown>)[k] = v;
+  }
+  return serializeFrontmatter(merged) + body;
+}
+
+function getRepoHead(repoPath: string): string | null {
+  try {
+    return execSync("git rev-parse HEAD", {
+      cwd: repoPath,
+      stdio: "pipe",
+      timeout: 3000,
+    })
+      .toString()
+      .trim();
+  } catch {
+    return null;
+  }
+}
+
+function getRepoTopLevel(somePath: string): string | null {
+  try {
+    return execSync("git rev-parse --show-toplevel", {
+      cwd: somePath,
+      stdio: "pipe",
+      timeout: 3000,
+    })
+      .toString()
+      .trim();
+  } catch {
+    return null;
+  }
+}
+
+function gitLogSince(
+  repoPath: string,
+  sinceCommit: string,
+  trackPaths: string[],
+  limit: number = 50,
+): { commits: string; count: number } {
+  const pathArgs =
+    trackPaths.length > 0
+      ? "-- " + trackPaths.map((p) => `'${p.replace(/'/g, "'\\''")}'`).join(" ")
+      : "";
+  try {
+    const out = execSync(
+      `git log --oneline -n ${limit + 1} ${sinceCommit}..HEAD ${pathArgs}`,
+      { cwd: repoPath, stdio: "pipe", timeout: 8000 },
+    ).toString();
+    const lines = out.split("\n").filter(Boolean);
+    return { commits: lines.slice(0, limit).join("\n"), count: lines.length };
+  } catch {
+    return { commits: "", count: 0 };
+  }
+}
+
 function rebuildIndex(): void {
   const indexPath = path.join(KB_DIR, "_index.md");
   const lines: string[] = [
@@ -100,33 +241,87 @@ server.tool(
 // 3. kb_write
 server.tool(
   "kb_write",
-  "Write or append to a knowledge base document. Auto-commits to git. Path relative to ~/knowledge/.",
+  "Write or append to a knowledge base document. Auto-commits to git. Path relative to ~/knowledge/. Optionally pass `codeRepo` (absolute path to source repo) so the doc's frontmatter records last-verified-commit + last-verified-at — used by kb_drift to detect staleness vs source code.",
   {
     path: z.string().describe("Relative path (e.g. 'systems/my-doc.md')"),
     content: z.string().describe("Content to write"),
     mode: z.enum(["replace", "append"]).default("append").describe("Write mode"),
+    codeRepo: z
+      .string()
+      .optional()
+      .describe(
+        "Absolute path to source repo this doc tracks (e.g. '/Users/dante/develop/auto-hotelier'). When set, frontmatter records last-verified-commit (current HEAD) and last-verified-at (now).",
+      ),
+    codeTracks: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Optional list of paths within codeRepo that this doc tracks (e.g. ['packages/db/prisma','apps/core/src/services']). Used by kb_drift to scope git log diff.",
+      ),
   },
-  async ({ path: filePath, content, mode }) => {
+  async ({ path: filePath, content, mode, codeRepo, codeTracks }) => {
     try {
       const fullPath = kbPath(filePath);
       const dir = path.dirname(fullPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-      if (mode === "append") {
-        fs.appendFileSync(fullPath, "\n" + content);
+      // Build the candidate full content
+      let finalContent: string;
+      if (mode === "append" && fs.existsSync(fullPath)) {
+        finalContent = fs.readFileSync(fullPath, "utf-8") + "\n" + content;
       } else {
-        fs.writeFileSync(fullPath, content);
+        finalContent = content;
       }
+
+      // Frontmatter: inject/update if codeRepo provided OR doc already has frontmatter
+      const { fm: existingFm } = parseFrontmatter(finalContent);
+      const hasExistingFm = Object.keys(existingFm).length > 0;
+      const updates: Partial<Frontmatter> = {};
+
+      if (codeRepo) {
+        const head = getRepoHead(codeRepo);
+        if (head) {
+          updates.lastVerifiedCommit = head;
+          updates.lastVerifiedAt = new Date().toISOString();
+          updates.codeRepo = codeRepo;
+        }
+      } else if (hasExistingFm && existingFm.codeRepo) {
+        // Doc already linked to a repo → refresh stamps to current HEAD
+        const head = getRepoHead(existingFm.codeRepo);
+        if (head) {
+          updates.lastVerifiedCommit = head;
+          updates.lastVerifiedAt = new Date().toISOString();
+        }
+      }
+
+      if (codeTracks && codeTracks.length > 0) {
+        updates.codeTracks = codeTracks;
+      }
+
+      if (Object.keys(updates).length > 0) {
+        finalContent = upsertFrontmatter(finalContent, updates);
+      }
+
+      fs.writeFileSync(fullPath, finalContent);
 
       rebuildIndex();
       const commitResult = gitCommit(`update ${filePath}`);
+      const fmNote =
+        Object.keys(updates).length > 0
+          ? ` Frontmatter: ${Object.keys(updates).join(", ")}.`
+          : "";
       return {
-        content: [{ type: "text", text: `Written to ${filePath} (${mode}). Git: ${commitResult}` }],
+        content: [
+          {
+            type: "text",
+            text: `Written to ${filePath} (${mode}).${fmNote} Git: ${commitResult}`,
+          },
+        ],
       };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Error: ${e.message}` }] };
     }
-  }
+  },
 );
 
 // 4. kb_log_decision
@@ -295,6 +490,253 @@ server.tool(
 
     return { content: [{ type: "text", text: report }] };
   }
+);
+
+// 7. kb_link_track
+server.tool(
+  "kb_link_track",
+  "Set a doc's source-code tracking metadata. After this call, the doc's frontmatter has `code-repo` + `code-tracks` set, plus `last-verified-commit` stamped to the repo's current HEAD. Use kb_drift afterwards to detect when source diverges.",
+  {
+    path: z.string().describe("Relative path to the doc (e.g. 'systems/my-doc.md')"),
+    codeRepo: z
+      .string()
+      .describe("Absolute path to source repo (e.g. '/Users/dante/develop/auto-hotelier')"),
+    codeTracks: z
+      .array(z.string())
+      .describe(
+        "Paths within codeRepo this doc tracks. Use directories OR specific files (e.g. ['packages/db/prisma/schema.prisma','apps/core/src/services/booking']). Empty array means whole repo.",
+      ),
+  },
+  async ({ path: filePath, codeRepo, codeTracks }) => {
+    try {
+      const fullPath = kbPath(filePath);
+      if (!fs.existsSync(fullPath)) {
+        return {
+          content: [{ type: "text", text: `Error: ${filePath} does not exist` }],
+        };
+      }
+      const head = getRepoHead(codeRepo);
+      if (!head) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: ${codeRepo} is not a git repo or HEAD unreadable`,
+            },
+          ],
+        };
+      }
+      const content = fs.readFileSync(fullPath, "utf-8");
+      const updated = upsertFrontmatter(content, {
+        lastVerifiedCommit: head,
+        lastVerifiedAt: new Date().toISOString(),
+        codeRepo,
+        codeTracks,
+      });
+      fs.writeFileSync(fullPath, updated);
+      const commitResult = gitCommit(
+        `link-track ${filePath} → ${codeRepo} (${head.slice(0, 7)})`,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Linked ${filePath} → ${codeRepo} @ ${head.slice(0, 7)} tracking [${codeTracks.join(", ")}]. Git: ${commitResult}`,
+          },
+        ],
+      };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Error: ${e.message}` }] };
+    }
+  },
+);
+
+// 8. kb_drift
+server.tool(
+  "kb_drift",
+  "Report drift between a KB doc and its tracked source code. Reads the doc's frontmatter (code-repo + last-verified-commit + code-tracks) and runs `git log <last-verified>..HEAD -- <code-tracks>` in the source repo. Output: list of commits the doc may not yet reflect, plus a summary line. Pass `bump=true` to also reset last-verified-commit to current HEAD (use only when you've manually verified the doc still matches HEAD).",
+  {
+    path: z.string().describe("Relative path to the doc"),
+    bump: z
+      .boolean()
+      .default(false)
+      .describe("If true, after reporting drift, update last-verified-commit to current HEAD"),
+  },
+  async ({ path: filePath, bump }) => {
+    try {
+      const fullPath = kbPath(filePath);
+      if (!fs.existsSync(fullPath)) {
+        return { content: [{ type: "text", text: `Error: ${filePath} does not exist` }] };
+      }
+      const content = fs.readFileSync(fullPath, "utf-8");
+      const { fm } = parseFrontmatter(content);
+
+      if (!fm.codeRepo) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${filePath}: no code-repo set. Use kb_link_track first.`,
+            },
+          ],
+        };
+      }
+      const currentHead = getRepoHead(fm.codeRepo);
+      if (!currentHead) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: ${fm.codeRepo} HEAD unreadable (repo missing or corrupt?)`,
+            },
+          ],
+        };
+      }
+
+      if (!fm.lastVerifiedCommit) {
+        // First-time drift: stamp current HEAD and report no drift
+        if (bump) {
+          const updated = upsertFrontmatter(content, {
+            lastVerifiedCommit: currentHead,
+            lastVerifiedAt: new Date().toISOString(),
+          });
+          fs.writeFileSync(fullPath, updated);
+          gitCommit(`drift-bump ${filePath} ${currentHead.slice(0, 7)}`);
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${filePath}: no last-verified-commit. ${bump ? "Stamped HEAD." : "Run with bump=true to baseline."}`,
+            },
+          ],
+        };
+      }
+
+      if (fm.lastVerifiedCommit === currentHead) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `🟢 ${filePath} is at HEAD (${currentHead.slice(0, 7)}) — no drift.`,
+            },
+          ],
+        };
+      }
+
+      const tracks = fm.codeTracks ?? [];
+      const { commits, count } = gitLogSince(fm.codeRepo, fm.lastVerifiedCommit, tracks);
+
+      const status = count === 0 ? "🟢" : count <= 5 ? "🟡" : "🔴";
+      const summary =
+        count === 0
+          ? `tracked paths unchanged (full-repo HEAD moved ${fm.lastVerifiedCommit.slice(0, 7)} → ${currentHead.slice(0, 7)})`
+          : `${count}${count > 50 ? "+" : ""} commits touched tracked paths since ${fm.lastVerifiedCommit.slice(0, 7)}`;
+
+      let report = `${status} ${filePath}\n  repo: ${fm.codeRepo}\n  tracks: ${tracks.length === 0 ? "(whole repo)" : tracks.join(", ")}\n  ${summary}\n`;
+      if (commits) {
+        report += `\nCommits since last verify:\n${commits}\n`;
+      }
+
+      if (bump) {
+        const updated = upsertFrontmatter(content, {
+          lastVerifiedCommit: currentHead,
+          lastVerifiedAt: new Date().toISOString(),
+        });
+        fs.writeFileSync(fullPath, updated);
+        gitCommit(`drift-bump ${filePath} → ${currentHead.slice(0, 7)}`);
+        report += `\n→ Stamped last-verified-commit = ${currentHead.slice(0, 7)}.`;
+      }
+
+      return { content: [{ type: "text", text: report }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Error: ${e.message}` }] };
+    }
+  },
+);
+
+// 9. kb_drift_all
+server.tool(
+  "kb_drift_all",
+  "Drift dashboard across all KB docs that have a code-repo set. Outputs one line per doc with status (🟢 OK / 🟡 minor / 🔴 major) + commit count. Use this at session start or before phase boundaries to spot stale docs quickly. Pass `repoFilter` to only check docs tracking a specific repo path.",
+  {
+    repoFilter: z
+      .string()
+      .optional()
+      .describe(
+        "Optional absolute repo path. When set, only docs with this code-repo are checked.",
+      ),
+  },
+  async ({ repoFilter }) => {
+    try {
+      const lines: string[] = ["# KB Drift Dashboard", ""];
+      let totalChecked = 0;
+      let totalDrifted = 0;
+
+      for (const section of ["systems", "ops", "decisions"]) {
+        const sectionDir = path.join(KB_DIR, section);
+        if (!fs.existsSync(sectionDir)) continue;
+        const docs = fs
+          .readdirSync(sectionDir)
+          .filter((f) => f.endsWith(".md"))
+          .sort();
+
+        const sectionLines: string[] = [];
+        for (const doc of docs) {
+          const docPath = path.join(sectionDir, doc);
+          const content = fs.readFileSync(docPath, "utf-8");
+          const { fm } = parseFrontmatter(content);
+          if (!fm.codeRepo) continue;
+          if (repoFilter && fm.codeRepo !== repoFilter) continue;
+          totalChecked++;
+
+          const currentHead = getRepoHead(fm.codeRepo);
+          if (!currentHead) {
+            sectionLines.push(`  ⚠️  ${doc}: code-repo unreachable (${fm.codeRepo})`);
+            continue;
+          }
+          if (!fm.lastVerifiedCommit) {
+            sectionLines.push(
+              `  ⚪ ${doc}: linked but never verified (run kb_drift with bump=true)`,
+            );
+            continue;
+          }
+          if (fm.lastVerifiedCommit === currentHead) {
+            sectionLines.push(`  🟢 ${doc}: at HEAD (${currentHead.slice(0, 7)})`);
+            continue;
+          }
+
+          const tracks = fm.codeTracks ?? [];
+          const { count } = gitLogSince(fm.codeRepo, fm.lastVerifiedCommit, tracks, 100);
+          if (count === 0) {
+            sectionLines.push(
+              `  🟢 ${doc}: tracked paths unchanged (HEAD ${fm.lastVerifiedCommit.slice(0, 7)} → ${currentHead.slice(0, 7)})`,
+            );
+            continue;
+          }
+          totalDrifted++;
+          const status = count <= 5 ? "🟡" : "🔴";
+          sectionLines.push(
+            `  ${status} ${doc}: ${count}${count > 100 ? "+" : ""} commits touched tracked paths since ${fm.lastVerifiedCommit.slice(0, 7)}`,
+          );
+        }
+
+        if (sectionLines.length > 0) {
+          lines.push(`## ${section.toUpperCase()}`);
+          lines.push(...sectionLines);
+          lines.push("");
+        }
+      }
+
+      lines.push(
+        `Summary: ${totalChecked} docs checked, ${totalDrifted} drifted${repoFilter ? ` (filter: ${repoFilter})` : ""}.`,
+      );
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Error: ${e.message}` }] };
+    }
+  },
 );
 
 // ── Start ──

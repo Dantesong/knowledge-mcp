@@ -187,8 +187,13 @@ function rebuildIndex(): void {
 
     lines.push(`## ${section.toUpperCase()}`, "");
     for (const file of files) {
-      const firstLine = fs.readFileSync(path.join(dir, file), "utf-8").split("\n")[0];
-      const title = firstLine.replace(/^#+ */, "") || file;
+      // Skip frontmatter (if present) before extracting title — otherwise the
+      // title shows as "---" for any drift-tracked doc.
+      const fileContent = fs.readFileSync(path.join(dir, file), "utf-8");
+      const { body } = parseFrontmatter(fileContent);
+      const firstNonEmpty =
+        body.split("\n").find((l) => l.trim().length > 0) || "";
+      const title = firstNonEmpty.replace(/^#+ */, "") || file;
       lines.push(`- ${title} — ${section}/${file}`);
     }
     lines.push("");

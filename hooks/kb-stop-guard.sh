@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop hook: KB Drift Bot — v1.2 (2026-06-11).
+# Stop hook: KB Drift Bot — v1.3 (2026-06-11).
 #
 # History:
 #   v1   — block on dirty repo + no KB update
@@ -17,6 +17,11 @@
 #          (A fine-grained per-doc code-tracks variant ("option C") lives in
 #          git history at f01e3d6 — deliberately NOT deployed; re-evaluate
 #          once kb_drift baselines have been honest for a month.)
+#   v1.3 — in-repo-docs pass (2026-06-11, AH collab migration): repos whose
+#          knowledge lives in-repo (marker: docs/systems/development-log.md;
+#          auto-hotelier 迁移后即此类) pass when THIS session edited
+#          <repo>/docs/** — transcript evidence only (v1.2 philosophy),
+#          worktree paths covered. ~/knowledge stays for cross-project docs.
 #
 # Deployed via symlink: ~/.claude/hooks/kb-stop-guard.sh -> this file.
 # This repo copy IS the live hook — single source, no more two-version drift.
@@ -115,6 +120,18 @@ if [[ $KB_TOOL_CALLED -eq 1 ]]; then
   exit 0
 fi
 
+# -- In-repo docs check (v1.3): repos that keep their knowledge in-repo
+#    satisfy the protocol by updating docs/ instead of ~/knowledge.
+#    Attribution philosophy same as v1.2: transcript evidence only — did
+#    THIS session Edit/Write a file under <repo>/docs/? (also matches
+#    <repo>/.claude/worktrees/<slug>/docs/ for worktree sessions)
+if [[ -f "$REPO_ROOT/docs/systems/development-log.md" && -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]]; then
+  if grep -qE "\"file_path\":\"$REPO_ROOT(/\.claude/worktrees/[^/\"]+)?/docs/" "$TRANSCRIPT" 2>/dev/null; then
+    log "session edited in-repo docs/ (docs-in-repo convention) -> allow stop"
+    exit 0
+  fi
+fi
+
 # -- Block --
 log "BLOCKING stop: code dirty + no KB update (repo=$REPO_ROOT)"
 
@@ -124,6 +141,7 @@ Per the Knowledge Protocol (~/knowledge/ is the global source of truth for ALL o
 - If you changed code, schema, deployment, or architecture in any meaningful way, you MUST reflect it in ~/knowledge/ via the mcp__knowledge__kb_write tool.
 - Significant changes also need an entry appended to the relevant development log (e.g. systems/auto-hotelier-development-log.md, systems/hotel-automation.md, etc.) describing what changed and why.
 - For architectural decisions, also call mcp__knowledge__kb_log_decision.
+- EXCEPTION — repos with in-repo knowledge (auto-hotelier since 2026-06-11): update the in-repo docs instead — docs/systems/<handbook>.md + docs/systems/development-log.md entry + docs/decisions.md for decisions. Editing any <repo>/docs/** file via Edit/Write this session passes this guard automatically.
 
 Uncommitted files in this repo:
 $CODE_DIRTY

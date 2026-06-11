@@ -238,6 +238,11 @@ Claude Code ←→ stdio ←→ knowledge-mcp ←→ ~/knowledge/（本地文件
 
 ## 更新日志
 
+### v1.1.1 (2026-06-11)
+
+- **session-start hook v1.3** — 按 `source` 区分注入：`resume` 直接跳过（旧注入随 transcript 已在上下文里，重注是纯重复 ~1.2k token）；每次调用把 `source` + 字节数记入 `~/.claude/hooks/kb-session-start.log`，先测量事件分布再决定是否进一步瘦身。
+- **工具 description 精简** — 9 个工具 + 冗长参数说明从 ~7.3KB schema 压到 5.5KB（在全量加载 MCP schema 的环境里每 session 省 ~450 token）。
+
 ### v1.1.0 (2026-06-11)
 
 - **精确暂存** — 废除 `git add -A`，只提交工具自己写的文件（并发 session 安全）

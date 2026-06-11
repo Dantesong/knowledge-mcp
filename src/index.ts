@@ -270,13 +270,13 @@ function rotationWarning(filePath: string, content: string): string {
 
 const server = new McpServer({
   name: "knowledge-mcp",
-  version: "1.1.0",
+  version: "1.1.1",
 });
 
 // 1. kb_search
 server.tool(
   "kb_search",
-  "Search the knowledge base for a keyword or phrase. Returns matching lines with file paths. Fixed-string by default so technical terms with ().[] match literally; pass regex=true for pattern search.",
+  "Search all KB .md files (case-insensitive). Fixed-string by default; regex=true for patterns.",
   {
     query: z.string().describe("Search term (case-insensitive, fixed-string by default)"),
     regex: z
@@ -319,7 +319,7 @@ server.tool(
 // 2. kb_read
 server.tool(
   "kb_read",
-  "Read a knowledge base document. Path is relative to ~/knowledge/ (e.g. 'systems/hotel-automation.md'). Files over 40KB return a heading outline by default — fetch a slice with {section} or {offset,limit}, or force everything with {full:true}.",
+  "Read a KB doc (path relative to ~/knowledge/). Files >40KB return a heading outline — slice with {section} or {offset,limit}, force whole file with {full:true}.",
   {
     path: z.string().describe("Relative path to .md file"),
     section: z
@@ -419,7 +419,7 @@ server.tool(
 // 3. kb_write
 server.tool(
   "kb_write",
-  "Write or append to a knowledge base document. Auto-commits to git (only the written file — concurrent sessions' work is never swallowed). Path relative to ~/knowledge/. Writing does NOT mean verifying: the drift baseline (last-verified-commit) only moves when you pass `codeRepo` (explicit re-link) or `verified:true` on a replace.",
+  "Write or append to a KB doc (auto git commit, stages only the written file). Writing ≠ verifying: the drift baseline moves only with codeRepo or verified:true on a replace.",
   {
     path: z.string().describe("Relative path (e.g. 'systems/my-doc.md')"),
     content: z.string().describe("Content to write"),
@@ -434,14 +434,12 @@ server.tool(
       .string()
       .optional()
       .describe(
-        "Absolute path to source repo this doc tracks (e.g. '/Users/dante/develop/auto-hotelier'). When set, frontmatter records last-verified-commit (current HEAD) and last-verified-at (now).",
+        "Absolute path to the source repo this doc tracks. Sets code-repo and stamps the drift baseline to current HEAD.",
       ),
     codeTracks: z
       .array(z.string())
       .optional()
-      .describe(
-        "Optional list of paths within codeRepo that this doc tracks (e.g. ['packages/db/prisma','apps/core/src/services']). Used by kb_drift to scope git log diff.",
-      ),
+      .describe("Paths within codeRepo this doc tracks (scopes kb_drift's git log)."),
   },
   async ({ path: filePath, content, mode, verified, codeRepo, codeTracks }) => {
     try {
@@ -580,7 +578,7 @@ server.tool(
 // 5. kb_index
 server.tool(
   "kb_index",
-  "Rebuild the knowledge base index from current files, commit it, and return it. Always regenerates _index.md (this is the single source of index generation — the legacy bash rebuild script is retired).",
+  "Rebuild _index.md from current files, commit, and return it.",
   {},
   async () => {
     try {
@@ -599,7 +597,7 @@ server.tool(
 // 6. kb_init
 server.tool(
   "kb_init",
-  "Scan for CLAUDE.md files across all projects, extract key info, and import into the knowledge base. Run once after install to bootstrap your KB from existing projects.",
+  "Bootstrap: scan projects for CLAUDE.md files and import them into the KB. Skips files that already exist.",
   {
     scan_dirs: z
       .string()
@@ -710,17 +708,13 @@ server.tool(
 // 7. kb_link_track
 server.tool(
   "kb_link_track",
-  "Set a doc's source-code tracking metadata. After this call, the doc's frontmatter has `code-repo` + `code-tracks` set, plus `last-verified-commit` stamped to the repo's current HEAD. Use kb_drift afterwards to detect when source diverges.",
+  "Link a doc to a source repo + tracked paths (frontmatter), stamping the drift baseline to the repo's current HEAD.",
   {
     path: z.string().describe("Relative path to the doc (e.g. 'systems/my-doc.md')"),
-    codeRepo: z
-      .string()
-      .describe("Absolute path to source repo (e.g. '/Users/dante/develop/auto-hotelier')"),
+    codeRepo: z.string().describe("Absolute path to the source repo"),
     codeTracks: z
       .array(z.string())
-      .describe(
-        "Paths within codeRepo this doc tracks. Use directories OR specific files (e.g. ['packages/db/prisma/schema.prisma','apps/core/src/services/booking']). Empty array means whole repo.",
-      ),
+      .describe("Paths within codeRepo to track (dirs or files); empty array = whole repo"),
   },
   async ({ path: filePath, codeRepo, codeTracks }) => {
     try {
@@ -770,7 +764,7 @@ server.tool(
 // 8. kb_drift
 server.tool(
   "kb_drift",
-  "Report drift between a KB doc and its tracked source code. Reads the doc's frontmatter (code-repo + last-verified-commit + code-tracks) and runs `git log <last-verified>..HEAD -- <code-tracks>` in the source repo. Output: list of commits the doc may not yet reflect, plus a summary line. Pass `bump=true` to also reset last-verified-commit to current HEAD (use only when you've manually verified the doc still matches HEAD).",
+  "List commits a doc's tracked code gained since last verify. bump=true re-stamps the baseline to HEAD — only after manually confirming the doc still matches.",
   {
     path: z.string().describe("Relative path to the doc"),
     bump: z
@@ -879,7 +873,7 @@ server.tool(
 // 9. kb_drift_all
 server.tool(
   "kb_drift_all",
-  "Drift dashboard across all KB docs that have a code-repo set. Outputs one line per doc with status (🟢 OK / 🟡 minor / 🔴 major) + commit count. Use this at session start or before phase boundaries to spot stale docs quickly. Pass `repoFilter` to only check docs tracking a specific repo path.",
+  "Drift dashboard: one status line (🟢/🟡/🔴/⚠️) per linked doc. Optional repoFilter narrows to one repo.",
   {
     repoFilter: z
       .string()

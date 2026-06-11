@@ -277,6 +277,11 @@ Claude Code ←→ stdio ←→ knowledge-mcp ←→ ~/knowledge/ (local files)
 
 ## Changelog
 
+### v1.1.1 (2026-06-11)
+
+- **Session-start hook v1.3** — source-aware: `resume` skips injection entirely (the original injection is already in the resumed transcript; re-injecting duplicated ~1.2k tokens). Every invocation logs `source` + bytes to `~/.claude/hooks/kb-session-start.log` so the startup/resume/clear/compact distribution can be measured before further trimming.
+- **Tool descriptions trimmed** — 9 tool + verbose param descriptions cut from ~7.3KB to 5.5KB of schema (~450 tokens/session in environments that load all MCP schemas up front).
+
 ### v1.1.0 (2026-06-11)
 
 - **Precise staging** — `git add -A` removed; tools stage only what they wrote (concurrent-session safety)

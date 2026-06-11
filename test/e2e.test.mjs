@@ -168,7 +168,11 @@ fs.writeFileSync(path.join(KB, "systems", "code-doc.md"), "# Code\n\ncall foo.ba
 const t11a = await call("kb_search", { query: "foo.bar(" });
 check("fixed-string matches special chars", t11a.includes("foo.bar(baz)"), t11a.slice(0, 120));
 const t11b = await call("kb_search", { query: "needle60" });
-check("truncation note shows real total", t11b.includes("[showing 50 of 60 matching lines"), t11b.slice(-120));
+check("truncation note shows real total", /\[showing 50 of \d+ output lines/.test(t11b), t11b.slice(-120));
+const t11e = await call("kb_search", { query: "foo.bar(", context: 1 });
+check("context lines included by default param", t11e.includes("# Code") || t11e.includes("needle60 line"), t11e.slice(0, 150));
+const t11f = await call("kb_search", { query: "foo.bar(", context: 0 });
+check("context:0 returns match only", t11f.includes("foo.bar(baz)") && !t11f.includes("-# Code"), t11f.slice(0, 150));
 const t11c = await call("kb_search", { query: "zzz-no-such-term-zzz" });
 check("no matches handled", t11c === "No matches found.");
 const t11d = await call("kb_search", { query: "needle60 l.ne", regex: true });

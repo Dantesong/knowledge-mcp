@@ -263,14 +263,14 @@ function rotationWarning(filePath: string, content: string): string {
   if (lineCount <= ROTATION_LINE_THRESHOLD && sizeKb <= ROTATION_KB_THRESHOLD) {
     return "";
   }
-  return `\n⚠️ ${filePath} is ${lineCount} lines / ${sizeKb.toFixed(0)}KB (threshold ${ROTATION_LINE_THRESHOLD} lines / ${ROTATION_KB_THRESHOLD}KB) — rotation due: move the oldest entries to an archive file (see systems/archive/ for the pattern).`;
+  return `\n⚠️ ${filePath} is ${lineCount} lines / ${sizeKb.toFixed(0)}KB (threshold ${ROTATION_LINE_THRESHOLD} lines / ${ROTATION_KB_THRESHOLD}KB) — rotation due: move the oldest entries to an archive file (see systems/archive/ for the pattern), then grep .claude/skills for section refs pointing at the moved entries.`;
 }
 
 // ── Server ──
 
 const server = new McpServer({
   name: "knowledge-mcp",
-  version: "1.1.1",
+  version: "1.1.2",
 });
 
 // 1. kb_search
@@ -283,14 +283,21 @@ server.tool(
       .boolean()
       .default(false)
       .describe("Treat query as an extended regular expression instead of a fixed string"),
+    context: z
+      .number()
+      .int()
+      .min(0)
+      .max(5)
+      .default(1)
+      .describe("Surrounding lines per hit (grep -C); 0 for matches only"),
   },
-  async ({ query, regex }) => {
+  async ({ query, regex, context }) => {
     try {
       let output = "";
       try {
         output = execFileSync(
           "grep",
-          ["-rni", regex ? "-E" : "-F", "--include=*.md", "--", query, "."],
+          ["-rni", `-C${context}`, regex ? "-E" : "-F", "--include=*.md", "--", query, "."],
           { cwd: KB_DIR, stdio: "pipe", timeout: 5000 },
         ).toString();
       } catch (e: any) {
@@ -304,7 +311,7 @@ server.tool(
       const shown = all.slice(0, 50).join("\n");
       const note =
         all.length > 50
-          ? `\n[showing 50 of ${all.length} matching lines — narrow your query]`
+          ? `\n[showing 50 of ${all.length} output lines — narrow your query or pass context:0]`
           : "";
       return {
         content: [{ type: "text", text: (shown || "No matches found.") + note }],

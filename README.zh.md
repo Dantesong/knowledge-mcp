@@ -238,6 +238,12 @@ Claude Code ←→ stdio ←→ knowledge-mcp ←→ ~/knowledge/（本地文件
 
 ## 更新日志
 
+### v1.1.2 (2026-06-11)
+
+- **`kb_search` 上下文行** — 新增 `context` 参数（grep `-C`，默认 1，可 0-5）：单行命中现在带前后文
+- **轮转警告**补充提醒：归档后 grep `.claude/skills` 修指向被移走条目的 section 引用
+- **KB repo 内新增 `scripts/sync.sh`** + Mac launchd / server cron：双向 ff-only 同步每 15-20 分钟（server 克隆曾两个月没 pull 过）
+
 ### v1.1.1 (2026-06-11)
 
 - **session-start hook v1.3** — 按 `source` 区分注入：`resume` 直接跳过（旧注入随 transcript 已在上下文里，重注是纯重复 ~1.2k token）；每次调用把 `source` + 字节数记入 `~/.claude/hooks/kb-session-start.log`，先测量事件分布再决定是否进一步瘦身。

@@ -277,6 +277,12 @@ Claude Code ←→ stdio ←→ knowledge-mcp ←→ ~/knowledge/ (local files)
 
 ## Changelog
 
+### v1.1.2 (2026-06-11)
+
+- **`kb_search` context lines** — `context` param (grep `-C`, default 1, 0-5): single-line hits now carry surrounding lines for usable context
+- **Rotation warning** now also reminds to grep `.claude/skills` for section refs pointing at moved entries (archived-heading references go stale silently otherwise)
+- **`scripts/sync.sh` in the KB repo** (not this repo) + Mac launchd / server cron: two-way ff-only sync every 15-20 min — the server clone once sat unpulled for 2 months
+
 ### v1.1.1 (2026-06-11)
 
 - **Session-start hook v1.3** — source-aware: `resume` skips injection entirely (the original injection is already in the resumed transcript; re-injecting duplicated ~1.2k tokens). Every invocation logs `source` + bytes to `~/.claude/hooks/kb-session-start.log` so the startup/resume/clear/compact distribution can be measured before further trimming.

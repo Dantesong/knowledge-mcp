@@ -4,28 +4,52 @@ import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { execSync } from "child_process";
+import { execSync, execFileSync } from "child_process";
 
 const KB_DIR = process.env.KNOWLEDGE_DIR || path.join(os.homedir(), "knowledge");
 
 function kbPath(relative: string): string {
   const resolved = path.resolve(KB_DIR, relative);
-  if (!resolved.startsWith(KB_DIR)) {
+  // Require a path separator after KB_DIR — a bare prefix check would let
+  // sibling dirs like ~/knowledge-evil pass.
+  if (resolved !== KB_DIR && !resolved.startsWith(KB_DIR + path.sep)) {
     throw new Error(`Path escapes knowledge base: ${relative}`);
   }
   return resolved;
 }
 
-function gitCommit(message: string): string {
+// Stage ONLY the files this tool wrote — never `git add -A`. Concurrent
+// sessions routinely leave uncommitted work in the KB working tree; a blanket
+// add would swallow it into an unrelated commit. execFileSync (argv array)
+// keeps user-supplied text (decision titles, paths) out of shell parsing.
+function gitCommit(message: string, files: string[]): string {
   try {
-    execSync(`git add -A && git commit -m "kb: ${message}"`, {
+    execFileSync("git", ["add", "--", ...files], {
+      cwd: KB_DIR,
+      stdio: "pipe",
+      timeout: 10000,
+    });
+    const staged = execFileSync(
+      "git",
+      ["diff", "--cached", "--name-only", "--", ...files],
+      { cwd: KB_DIR, stdio: "pipe", timeout: 10000 },
+    )
+      .toString()
+      .trim();
+    if (!staged) return "no changes to commit";
+    // Commit restricted to these paths, so anything another session staged
+    // stays staged and untouched.
+    execFileSync("git", ["commit", "-m", `kb: ${message}`, "--", ...files], {
       cwd: KB_DIR,
       stdio: "pipe",
       timeout: 10000,
     });
     return "committed";
-  } catch {
-    return "no changes to commit";
+  } catch (e: any) {
+    const detail = (e.stderr?.toString() || e.message || "unknown git failure")
+      .trim()
+      .split("\n")[0];
+    return `git error: ${detail}`;
   }
 }
 
@@ -153,20 +177,25 @@ function gitLogSince(
   sinceCommit: string,
   trackPaths: string[],
   limit: number = 50,
-): { commits: string; count: number } {
-  const pathArgs =
-    trackPaths.length > 0
-      ? "-- " + trackPaths.map((p) => `'${p.replace(/'/g, "'\\''")}'`).join(" ")
-      : "";
+): { commits: string; count: number; error?: string } {
+  const args = ["log", "--oneline", "-n", String(limit + 1), `${sinceCommit}..HEAD`];
+  if (trackPaths.length > 0) args.push("--", ...trackPaths);
   try {
-    const out = execSync(
-      `git log --oneline -n ${limit + 1} ${sinceCommit}..HEAD ${pathArgs}`,
-      { cwd: repoPath, stdio: "pipe", timeout: 8000 },
-    ).toString();
+    const out = execFileSync("git", args, {
+      cwd: repoPath,
+      stdio: "pipe",
+      timeout: 8000,
+    }).toString();
     const lines = out.split("\n").filter(Boolean);
     return { commits: lines.slice(0, limit).join("\n"), count: lines.length };
-  } catch {
-    return { commits: "", count: 0 };
+  } catch (e: any) {
+    // A failed git log is NOT "zero drift" — most commonly the baseline commit
+    // became unreachable after a rebase/amend. Surface the error so callers
+    // show ⚠️ instead of a false 🟢.
+    const detail = (e.stderr?.toString() || e.message || "git log failed")
+      .trim()
+      .split("\n")[0];
+    return { commits: "", count: -1, error: detail };
   }
 }
 
@@ -179,7 +208,7 @@ function rebuildIndex(): void {
     "",
   ];
 
-  for (const section of ["systems", "ops", "decisions"]) {
+  for (const section of ["systems", "ops", "decisions", "inbox"]) {
     const dir = path.join(KB_DIR, section);
     if (!fs.existsSync(dir)) continue;
     const files = fs.readdirSync(dir).filter((f) => f.endsWith(".md")).sort();
@@ -187,14 +216,21 @@ function rebuildIndex(): void {
 
     lines.push(`## ${section.toUpperCase()}`, "");
     for (const file of files) {
-      // Skip frontmatter (if present) before extracting title — otherwise the
-      // title shows as "---" for any drift-tracked doc.
+      // Skip frontmatter, then prefer the first markdown heading — the first
+      // non-empty line is often a SUPERSEDED banner or blockquote, not a title.
       const fileContent = fs.readFileSync(path.join(dir, file), "utf-8");
       const { body } = parseFrontmatter(fileContent);
-      const firstNonEmpty =
-        body.split("\n").find((l) => l.trim().length > 0) || "";
-      const title = firstNonEmpty.replace(/^#+ */, "") || file;
-      lines.push(`- ${title} — ${section}/${file}`);
+      const bodyLines = body.split("\n");
+      const heading = bodyLines.find((l) => /^#{1,6}\s+\S/.test(l));
+      const firstNonEmpty = bodyLines.find((l) => l.trim().length > 0) || "";
+      const title =
+        (heading || firstNonEmpty).replace(/^#+\s*/, "").trim() || file;
+      const supersededTag = bodyLines
+        .slice(0, 10)
+        .some((l) => /SUPERSEDED/i.test(l))
+        ? " [SUPERSEDED]"
+        : "";
+      lines.push(`- ${title}${supersededTag} — ${section}/${file}`);
     }
     lines.push("");
   }
@@ -202,28 +238,80 @@ function rebuildIndex(): void {
   fs.writeFileSync(indexPath, lines.join("\n"));
 }
 
+// Heading outline for large docs: h1-h3 with line ranges, so callers can pick
+// a section instead of pulling the whole file into context.
+function buildOutline(lines: string[]): string {
+  const out: string[] = [];
+  let prev: { text: string; line: number } | null = null;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^#{1,3}\s+\S/.test(lines[i])) {
+      if (prev) out.push(`  ${prev.text}  (lines ${prev.line}-${i})`);
+      prev = { text: lines[i], line: i + 1 };
+    }
+  }
+  if (prev) out.push(`  ${prev.text}  (lines ${prev.line}-${lines.length})`);
+  return out.length > 0 ? out.join("\n") : "  (no headings found)";
+}
+
+const OUTLINE_THRESHOLD_BYTES = 40 * 1024;
+const ROTATION_LINE_THRESHOLD = 4000;
+const ROTATION_KB_THRESHOLD = 200;
+
+function rotationWarning(filePath: string, content: string): string {
+  const lineCount = content.split("\n").length;
+  const sizeKb = Buffer.byteLength(content) / 1024;
+  if (lineCount <= ROTATION_LINE_THRESHOLD && sizeKb <= ROTATION_KB_THRESHOLD) {
+    return "";
+  }
+  return `\n⚠️ ${filePath} is ${lineCount} lines / ${sizeKb.toFixed(0)}KB (threshold ${ROTATION_LINE_THRESHOLD} lines / ${ROTATION_KB_THRESHOLD}KB) — rotation due: move the oldest entries to an archive file (see systems/archive/ for the pattern).`;
+}
+
 // ── Server ──
 
 const server = new McpServer({
   name: "knowledge-mcp",
-  version: "1.0.0",
+  version: "1.1.0",
 });
 
 // 1. kb_search
 server.tool(
   "kb_search",
-  "Search the knowledge base for a keyword or phrase. Returns matching lines with file paths.",
-  { query: z.string().describe("Search term (case-insensitive grep)") },
-  async ({ query }) => {
+  "Search the knowledge base for a keyword or phrase. Returns matching lines with file paths. Fixed-string by default so technical terms with ().[] match literally; pass regex=true for pattern search.",
+  {
+    query: z.string().describe("Search term (case-insensitive, fixed-string by default)"),
+    regex: z
+      .boolean()
+      .default(false)
+      .describe("Treat query as an extended regular expression instead of a fixed string"),
+  },
+  async ({ query, regex }) => {
     try {
-      const output = execSync(
-        `grep -rni "${query.replace(/"/g, '\\"')}" --include="*.md" .`,
-        { cwd: KB_DIR, stdio: "pipe", timeout: 5000 }
-      ).toString();
-      const trimmed = output.split("\n").slice(0, 50).join("\n");
-      return { content: [{ type: "text", text: trimmed || "No matches found." }] };
-    } catch {
-      return { content: [{ type: "text", text: "No matches found." }] };
+      let output = "";
+      try {
+        output = execFileSync(
+          "grep",
+          ["-rni", regex ? "-E" : "-F", "--include=*.md", "--", query, "."],
+          { cwd: KB_DIR, stdio: "pipe", timeout: 5000 },
+        ).toString();
+      } catch (e: any) {
+        // grep exit 1 = no matches; anything else is a real error
+        if (e.status === 1) {
+          return { content: [{ type: "text", text: "No matches found." }] };
+        }
+        throw e;
+      }
+      const all = output.split("\n").filter(Boolean);
+      const shown = all.slice(0, 50).join("\n");
+      const note =
+        all.length > 50
+          ? `\n[showing 50 of ${all.length} matching lines — narrow your query]`
+          : "";
+      return {
+        content: [{ type: "text", text: (shown || "No matches found.") + note }],
+      };
+    } catch (e: any) {
+      const detail = (e.stderr?.toString() || e.message || "").trim().split("\n")[0];
+      return { content: [{ type: "text", text: `Search error: ${detail}` }] };
     }
   }
 );
@@ -231,11 +319,96 @@ server.tool(
 // 2. kb_read
 server.tool(
   "kb_read",
-  "Read a knowledge base document. Path is relative to ~/knowledge/ (e.g. 'systems/hotel-automation.md').",
-  { path: z.string().describe("Relative path to .md file") },
-  async ({ path: filePath }) => {
+  "Read a knowledge base document. Path is relative to ~/knowledge/ (e.g. 'systems/hotel-automation.md'). Files over 40KB return a heading outline by default — fetch a slice with {section} or {offset,limit}, or force everything with {full:true}.",
+  {
+    path: z.string().describe("Relative path to .md file"),
+    section: z
+      .string()
+      .optional()
+      .describe(
+        "Return only the section whose heading contains this text (case-insensitive), up to the next same-or-higher-level heading",
+      ),
+    offset: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("1-based line number to start reading from"),
+    limit: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("Max lines to return (combine with offset)"),
+    full: z
+      .boolean()
+      .default(false)
+      .describe("Force whole-file read even when the file exceeds the outline threshold"),
+  },
+  async ({ path: filePath, section, offset, limit, full }) => {
     try {
       const content = fs.readFileSync(kbPath(filePath), "utf-8");
+      const lines = content.split("\n");
+      const meta = `[${filePath}: ${lines.length} lines / ${(Buffer.byteLength(content) / 1024).toFixed(0)}KB]`;
+
+      if (section) {
+        const needle = section.toLowerCase();
+        const startIdx = lines.findIndex(
+          (l) => /^#{1,6}\s/.test(l) && l.toLowerCase().includes(needle),
+        );
+        if (startIdx < 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `${meta}\nSection "${section}" not found. Headings:\n${buildOutline(lines)}`,
+              },
+            ],
+          };
+        }
+        const level = (lines[startIdx].match(/^#+/) as RegExpMatchArray)[0].length;
+        let endIdx = lines.length;
+        for (let i = startIdx + 1; i < lines.length; i++) {
+          const m = lines[i].match(/^(#{1,6})\s/);
+          if (m && m[1].length <= level) {
+            endIdx = i;
+            break;
+          }
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${meta} — section at lines ${startIdx + 1}-${endIdx}\n${lines.slice(startIdx, endIdx).join("\n")}`,
+            },
+          ],
+        };
+      }
+
+      if (offset || limit) {
+        const start = (offset ?? 1) - 1;
+        const slice = lines.slice(start, limit ? start + limit : undefined);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${meta} — showing lines ${start + 1}-${start + slice.length}\n${slice.join("\n")}`,
+            },
+          ],
+        };
+      }
+
+      if (!full && Buffer.byteLength(content) > OUTLINE_THRESHOLD_BYTES) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${meta} — large file, outline only (re-call with {section} or {offset,limit} for a slice, {full:true} to force the whole file):\n${buildOutline(lines)}`,
+            },
+          ],
+        };
+      }
+
       return { content: [{ type: "text", text: content }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Error: ${e.message}` }] };
@@ -246,11 +419,17 @@ server.tool(
 // 3. kb_write
 server.tool(
   "kb_write",
-  "Write or append to a knowledge base document. Auto-commits to git. Path relative to ~/knowledge/. Optionally pass `codeRepo` (absolute path to source repo) so the doc's frontmatter records last-verified-commit + last-verified-at — used by kb_drift to detect staleness vs source code.",
+  "Write or append to a knowledge base document. Auto-commits to git (only the written file — concurrent sessions' work is never swallowed). Path relative to ~/knowledge/. Writing does NOT mean verifying: the drift baseline (last-verified-commit) only moves when you pass `codeRepo` (explicit re-link) or `verified:true` on a replace.",
   {
     path: z.string().describe("Relative path (e.g. 'systems/my-doc.md')"),
     content: z.string().describe("Content to write"),
     mode: z.enum(["replace", "append"]).default("append").describe("Write mode"),
+    verified: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Declare the doc verified against its linked repo's current HEAD. Only honored with mode=replace — appending a log line is not verification.",
+      ),
     codeRepo: z
       .string()
       .optional()
@@ -264,38 +443,57 @@ server.tool(
         "Optional list of paths within codeRepo that this doc tracks (e.g. ['packages/db/prisma','apps/core/src/services']). Used by kb_drift to scope git log diff.",
       ),
   },
-  async ({ path: filePath, content, mode, codeRepo, codeTracks }) => {
+  async ({ path: filePath, content, mode, verified, codeRepo, codeTracks }) => {
     try {
       const fullPath = kbPath(filePath);
       const dir = path.dirname(fullPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
+      const fileExists = fs.existsSync(fullPath);
+
       // Build the candidate full content
       let finalContent: string;
-      if (mode === "append" && fs.existsSync(fullPath)) {
+      if (mode === "append" && fileExists) {
         finalContent = fs.readFileSync(fullPath, "utf-8") + "\n" + content;
+      } else if (mode === "replace" && fileExists) {
+        // Inherit the existing frontmatter when the new content doesn't carry
+        // its own — otherwise a full rewrite silently drops drift-tracking
+        // metadata and the doc vanishes from the kb_drift_all dashboard.
+        const { fm: oldFm } = parseFrontmatter(fs.readFileSync(fullPath, "utf-8"));
+        const { fm: newFm } = parseFrontmatter(content);
+        if (Object.keys(oldFm).length > 0 && Object.keys(newFm).length === 0) {
+          finalContent = serializeFrontmatter(oldFm) + content;
+        } else {
+          finalContent = content;
+        }
       } else {
         finalContent = content;
       }
 
-      // Frontmatter: inject/update if codeRepo provided OR doc already has frontmatter
       const { fm: existingFm } = parseFrontmatter(finalContent);
-      const hasExistingFm = Object.keys(existingFm).length > 0;
       const updates: Partial<Frontmatter> = {};
+      let baselineNote = "";
 
       if (codeRepo) {
+        // Explicit (re-)link — caller declares this doc verified against HEAD
         const head = getRepoHead(codeRepo);
         if (head) {
           updates.lastVerifiedCommit = head;
           updates.lastVerifiedAt = new Date().toISOString();
           updates.codeRepo = codeRepo;
         }
-      } else if (hasExistingFm && existingFm.codeRepo) {
-        // Doc already linked to a repo → refresh stamps to current HEAD
-        const head = getRepoHead(existingFm.codeRepo);
-        if (head) {
-          updates.lastVerifiedCommit = head;
-          updates.lastVerifiedAt = new Date().toISOString();
+      } else if (existingFm.codeRepo) {
+        // Linked doc: writing is not verifying. A routine append must never
+        // refresh the drift baseline — that was silently erasing real drift.
+        if (mode === "replace" && verified) {
+          const head = getRepoHead(existingFm.codeRepo);
+          if (head) {
+            updates.lastVerifiedCommit = head;
+            updates.lastVerifiedAt = new Date().toISOString();
+          }
+        } else {
+          baselineNote =
+            " Drift baseline unchanged (pass verified:true on a replace to re-stamp).";
         }
       }
 
@@ -310,7 +508,7 @@ server.tool(
       fs.writeFileSync(fullPath, finalContent);
 
       rebuildIndex();
-      const commitResult = gitCommit(`update ${filePath}`);
+      const commitResult = gitCommit(`update ${filePath}`, [filePath, "_index.md"]);
       const fmNote =
         Object.keys(updates).length > 0
           ? ` Frontmatter: ${Object.keys(updates).join(", ")}.`
@@ -319,7 +517,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Written to ${filePath} (${mode}).${fmNote} Git: ${commitResult}`,
+            text: `Written to ${filePath} (${mode}).${fmNote}${baselineNote} Git: ${commitResult}${rotationWarning(filePath, finalContent)}`,
           },
         ],
       };
@@ -360,9 +558,18 @@ server.tool(
       fs.appendFileSync(decisionsPath, entry);
 
       rebuildIndex();
-      const commitResult = gitCommit(`decision: ${title}`);
+      const commitResult = gitCommit(`decision: ${title}`, [
+        "decisions/decisions.md",
+        "_index.md",
+      ]);
+      const finalContent = fs.readFileSync(decisionsPath, "utf-8");
       return {
-        content: [{ type: "text", text: `Decision logged: ${title}. Git: ${commitResult}` }],
+        content: [
+          {
+            type: "text",
+            text: `Decision logged: ${title}. Git: ${commitResult}${rotationWarning("decisions/decisions.md", finalContent)}`,
+          },
+        ],
       };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Error: ${e.message}` }] };
@@ -373,16 +580,16 @@ server.tool(
 // 5. kb_index
 server.tool(
   "kb_index",
-  "Show the knowledge base index — list of all documents organized by category.",
+  "Rebuild the knowledge base index from current files, commit it, and return it. Always regenerates _index.md (this is the single source of index generation — the legacy bash rebuild script is retired).",
   {},
   async () => {
     try {
-      const indexPath = path.join(KB_DIR, "_index.md");
-      if (!fs.existsSync(indexPath)) {
-        rebuildIndex();
-      }
-      const content = fs.readFileSync(indexPath, "utf-8");
-      return { content: [{ type: "text", text: content }] };
+      rebuildIndex();
+      const content = fs.readFileSync(path.join(KB_DIR, "_index.md"), "utf-8");
+      const commitResult = gitCommit("rebuild index", ["_index.md"]);
+      return {
+        content: [{ type: "text", text: `${content}\n\n(Git: ${commitResult})` }],
+      };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Error: ${e.message}` }] };
     }
@@ -396,7 +603,7 @@ server.tool(
   {
     scan_dirs: z
       .string()
-      .default("~,~/dev,~/projects,~/src,~/work")
+      .default("~,~/dev,~/develop,~/projects,~/src,~/work")
       .describe("Comma-separated directories to scan for projects with CLAUDE.md"),
   },
   async ({ scan_dirs }) => {
@@ -450,12 +657,14 @@ server.tool(
 
     // Import each project
     const results: string[] = [];
+    const written: string[] = ["_index.md"];
     for (const { project, claudeMdPath, summary } of found) {
       if (project === "_global") {
         // Global rules → ops/global-rules.md
         const target = path.join(KB_DIR, "ops", "global-rules.md");
         if (!fs.existsSync(target)) {
           fs.writeFileSync(target, summary);
+          written.push("ops/global-rules.md");
           results.push(`  ops/global-rules.md ← ${claudeMdPath} (new)`);
         } else {
           results.push(`  ops/global-rules.md ← already exists, skipped`);
@@ -478,11 +687,12 @@ server.tool(
       const header = `# ${project}\n\n> Imported from ${claudeMdPath}\n> Run kb_init again to refresh (will skip existing files — delete first to reimport)\n\n`;
 
       fs.writeFileSync(target, header + trimmed);
+      written.push(`systems/${safeName}.md`);
       results.push(`  systems/${safeName}.md ← ${claudeMdPath} (imported)`);
     }
 
     rebuildIndex();
-    const commitResult = gitCommit(`init: imported ${found.length} project docs`);
+    const commitResult = gitCommit(`init: imported ${found.length} project docs`, written);
 
     const report = [
       `Scanned: ${dirs.join(", ")}`,
@@ -541,6 +751,7 @@ server.tool(
       fs.writeFileSync(fullPath, updated);
       const commitResult = gitCommit(
         `link-track ${filePath} → ${codeRepo} (${head.slice(0, 7)})`,
+        [filePath],
       );
       return {
         content: [
@@ -606,7 +817,7 @@ server.tool(
             lastVerifiedAt: new Date().toISOString(),
           });
           fs.writeFileSync(fullPath, updated);
-          gitCommit(`drift-bump ${filePath} ${currentHead.slice(0, 7)}`);
+          gitCommit(`drift-bump ${filePath} ${currentHead.slice(0, 7)}`, [filePath]);
         }
         return {
           content: [
@@ -630,11 +841,16 @@ server.tool(
       }
 
       const tracks = fm.codeTracks ?? [];
-      const { commits, count } = gitLogSince(fm.codeRepo, fm.lastVerifiedCommit, tracks);
+      const { commits, count, error } = gitLogSince(
+        fm.codeRepo,
+        fm.lastVerifiedCommit,
+        tracks,
+      );
 
-      const status = count === 0 ? "🟢" : count <= 5 ? "🟡" : "🔴";
-      const summary =
-        count === 0
+      const status = error ? "⚠️" : count === 0 ? "🟢" : count <= 5 ? "🟡" : "🔴";
+      const summary = error
+        ? `git log failed: ${error} — last-verified-commit ${fm.lastVerifiedCommit.slice(0, 7)} likely unreachable (rebase/amend?). NOT zero drift. After manually confirming the doc matches HEAD, re-baseline with bump=true.`
+        : count === 0
           ? `tracked paths unchanged (full-repo HEAD moved ${fm.lastVerifiedCommit.slice(0, 7)} → ${currentHead.slice(0, 7)})`
           : `${count}${count > 50 ? "+" : ""} commits touched tracked paths since ${fm.lastVerifiedCommit.slice(0, 7)}`;
 
@@ -649,7 +865,7 @@ server.tool(
           lastVerifiedAt: new Date().toISOString(),
         });
         fs.writeFileSync(fullPath, updated);
-        gitCommit(`drift-bump ${filePath} → ${currentHead.slice(0, 7)}`);
+        gitCommit(`drift-bump ${filePath} → ${currentHead.slice(0, 7)}`, [filePath]);
         report += `\n→ Stamped last-verified-commit = ${currentHead.slice(0, 7)}.`;
       }
 
@@ -712,7 +928,19 @@ server.tool(
           }
 
           const tracks = fm.codeTracks ?? [];
-          const { count } = gitLogSince(fm.codeRepo, fm.lastVerifiedCommit, tracks, 100);
+          const { count, error } = gitLogSince(
+            fm.codeRepo,
+            fm.lastVerifiedCommit,
+            tracks,
+            100,
+          );
+          if (error) {
+            totalDrifted++;
+            sectionLines.push(
+              `  ⚠️ ${doc}: git log failed (${error}) — baseline ${fm.lastVerifiedCommit.slice(0, 7)} likely unreachable, re-baseline with kb_drift bump=true`,
+            );
+            continue;
+          }
           if (count === 0) {
             sectionLines.push(
               `  🟢 ${doc}: tracked paths unchanged (HEAD ${fm.lastVerifiedCommit.slice(0, 7)} → ${currentHead.slice(0, 7)})`,

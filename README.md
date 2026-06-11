@@ -8,17 +8,17 @@ Exposes 9 tools to Claude Code via stdio MCP:
 
 | Tool | Description |
 |------|-------------|
-| `kb_search` | Grep search across all .md files |
-| `kb_read` | Read a specific document |
-| `kb_write` | Write/append to a document (auto git commit, optional drift-stamping) |
+| `kb_search` | Search across all .md files — fixed-string by default (`regex:true` opt-in), truncation note with real match count |
+| `kb_read` | Read a document. `{section:"heading text"}` / `{offset,limit}` slices; files >40KB return a heading outline by default (`full:true` to force) |
+| `kb_write` | Write/append to a document (auto git commit). Writing ≠ verifying: the drift baseline only moves with `codeRepo` or `verified:true` on a replace |
 | `kb_log_decision` | Log a technical decision with timestamp |
-| `kb_index` | Rebuild the full document index |
+| `kb_index` | Rebuild `_index.md` from current files (always regenerates) and return it |
 | `kb_init` | Scan all projects for CLAUDE.md, auto-import into KB |
 | `kb_link_track` | Link a doc to a source repo + paths it tracks (drift baseline) |
 | `kb_drift` | Diff one doc vs source code since last verify; optional `bump` to rebaseline |
-| `kb_drift_all` | Drift dashboard 🟢/🟡/🔴 across all linked docs (optional repo filter) |
+| `kb_drift_all` | Drift dashboard 🟢/🟡/🔴/⚠️ across all linked docs (optional repo filter) |
 
-Every write operation automatically commits to git, giving you version history of all knowledge changes.
+Every write operation automatically commits to git — staging **only the files the tool itself wrote** (never `git add -A`), so concurrent sessions' uncommitted work in the KB working tree is never swallowed into unrelated commits. Oversized files (>4000 lines / 200KB) trigger a rotation warning in the tool response.
 
 ## Drift detection (added 2026-04-25)
 
@@ -41,12 +41,14 @@ code-tracks: ["packages/db/prisma/schema.prisma","packages/db/prisma/migrations/
 Workflow:
 
 1. **One-time setup** per doc: `kb_link_track` declares the repo + paths the doc tracks (or pass `codeRepo`+`codeTracks` directly to `kb_write`)
-2. **At session start / phase boundaries**: `kb_drift_all` shows which docs are 🟢 at HEAD / 🟡 small drift / 🔴 major drift
+2. **At session start / phase boundaries**: `kb_drift_all` shows which docs are 🟢 at HEAD / 🟡 small drift / 🔴 major drift / ⚠️ baseline unreachable
 3. **Per-doc drill-in**: `kb_drift <path>` outputs the actual `git log <last-verified>..HEAD -- <code-tracks>` so you see exactly which commits the doc may not yet reflect
-4. **After updating a doc**: `kb_write` auto-stamps `last-verified-commit` to current HEAD so the drift counter resets
+4. **After verifying a doc against HEAD**: `kb_write` with `mode:"replace", verified:true` (or with `codeRepo`) re-stamps `last-verified-commit`. **Writing alone never moves the baseline** — v1.0 auto-stamped on every write, which let routine log appends silently erase real drift (false-fresh)
 5. **No-op rebaseline**: `kb_drift <path> bump=true` for cases where source changed but the doc's claims didn't need an update
 
-The Stop hook (`hooks/kb-stop-guard.sh`) uses the linkage too: if you change code in repo X, the hook scans all docs with `code-repo: X` and `code-tracks` matching your changed files, and blocks the stop until those specific docs are touched (or `kb_drift bump=true` is run on each).
+If the baseline commit becomes unreachable (rebase/amend), `kb_drift` reports ⚠️ with the git error instead of a false 🟢 — an unreadable history is not "zero drift".
+
+> A fine-grained Stop-hook variant that scans `code-tracks` against your changed files and blocks per-doc lives in git history (`f01e3d6`, "option C"). It is deliberately not deployed — re-evaluate once baselines have been honest for a while.
 
 ## Install
 
@@ -93,18 +95,18 @@ The MCP server provides the tools, but Claude won't reliably use them without en
 
 | Hook | Event | Behavior |
 |------|-------|----------|
-| `kb-session-start.sh` | `SessionStart` | Injects `_index.md` + protocol rules into Claude's context at session start. Claude sees the full catalog of knowledge docs before doing anything. |
-| `kb-stop-guard.sh` | `Stop` | Checks if the working tree has uncommitted code changes AND no `kb_write`/`kb_log_decision` was called this session. If so, **blocks Claude from stopping** until knowledge is updated. |
+| `kb-session-start.sh` | `SessionStart` | Injects `_index.md` into Claude's context at session start (protocol rules belong in `CLAUDE.md` — injecting them here too would pay for the same text twice per session). |
+| `kb-stop-guard.sh` | `Stop` | Checks if the working tree has uncommitted code changes (or commits in the last hour) AND no `kb_write`/`kb_log_decision` was called this session. If so, **blocks Claude from stopping** until knowledge is updated. |
 
 ### Install the hooks
 
-**Step 1: Copy hook scripts**
+**Step 1: Symlink hook scripts** (single source — the repo copy IS the live hook; `cp` instead of `ln -s` is how this repo's own hooks drifted from the deployed copies for 47 days unnoticed)
 
 ```bash
 mkdir -p ~/.claude/hooks
-cp hooks/kb-session-start.sh ~/.claude/hooks/
-cp hooks/kb-stop-guard.sh ~/.claude/hooks/
-chmod +x ~/.claude/hooks/kb-session-start.sh ~/.claude/hooks/kb-stop-guard.sh
+chmod +x hooks/kb-session-start.sh hooks/kb-stop-guard.sh
+ln -sf "$(pwd)/hooks/kb-session-start.sh" ~/.claude/hooks/kb-session-start.sh
+ln -sf "$(pwd)/hooks/kb-stop-guard.sh" ~/.claude/hooks/kb-stop-guard.sh
 ```
 
 **Step 2: Register hooks in Claude Code settings**
@@ -172,11 +174,13 @@ Hooks are snapshot at session start. Close all Claude Code sessions and reopen f
 stop_hook_active = true?            → allow (loop guard, prevents infinite block)
 cwd in ~/knowledge/ or ~/.claude/?  → allow (excluded dirs)
 cwd not in a git repo?              → allow (nothing to enforce)
-git working tree clean?             → allow (no code changes to document)
-~/knowledge/ repo is dirty?         → allow (knowledge already being updated)
+working tree clean AND no commits
+  in the last hour?                 → allow (no code changes to document)
 session transcript has kb_write?    → allow (knowledge was updated via MCP)
 none of the above                   → BLOCK (code changed, knowledge not updated)
 ```
+
+> v1.2 removed the old "`~/knowledge/` repo is dirty → allow" pass: it couldn't tell *this* session's KB update from a concurrent session's leftover dirty files, so any parallel session's WIP gave every other session a free pass. The transcript check is the only automatic pass now.
 
 Filtered noise (won't trigger block): `tsconfig.tsbuildinfo`, `HANDOFF.md`, `.next/`, `node_modules/`, `dist/`, `build/`, `.DS_Store`, `*.log`
 
@@ -266,10 +270,25 @@ Claude Code ←→ stdio ←→ knowledge-mcp ←→ ~/knowledge/ (local files)
 ```
 
 - **Transport**: stdio (local only, no network)
-- **Git**: Every `kb_write` and `kb_log_decision` runs `git add -A && git commit`
-- **Index**: Auto-rebuilt after every write
-- **Security**: Path traversal protection — can't escape KB directory
+- **Git**: Every `kb_write` and `kb_log_decision` stages **only the files it wrote** and commits them (`git commit -m ... -- <paths>`); other sessions' staged/dirty work is untouched. Git failures surface as `git error: …` in the response, never silently swallowed
+- **Index**: Auto-rebuilt after every write; titles come from the first markdown heading (frontmatter/banner-safe), SUPERSEDED docs are tagged, `inbox/` is listed
+- **Security**: Path traversal protection (incl. sibling-prefix dirs like `~/knowledge-evil`); all git/grep invocations use argv arrays — no shell interpolation of user text
 - **Enforcement**: Optional hooks block Claude from ending sessions without updating knowledge
+
+## Changelog
+
+### v1.1.0 (2026-06-11)
+
+- **Precise staging** — `git add -A` removed; tools stage only what they wrote (concurrent-session safety)
+- **Writing ≠ verifying** — appends never refresh `last-verified-commit`; replace re-stamps only with `verified:true` or `codeRepo`; replace inherits existing frontmatter when the new content carries none
+- **Honest drift** — unreachable baselines report ⚠️ + git error instead of false 🟢
+- **Large-file reads** — `kb_read` gains `section` / `offset`+`limit` / `full`; >40KB files return a heading outline by default
+- **Rotation warnings** — writes leaving a file >4000 lines / 200KB say so in the response
+- **`kb_index` actually rebuilds** (previously only when `_index.md` was missing)
+- **`kb_search`** fixed-string by default, `regex:true` opt-in, truncation note
+- **Injection hardening** — argv arrays for git/grep; `kbPath` requires a path separator after the KB root
+- **Hooks v1.2** — stop-guard drops the dirty-KB free pass; session-start injects only the index; deploy via symlink
+- E2E test suite: `npm run build && node test/e2e.test.mjs` (33 checks)
 
 ## License
 
